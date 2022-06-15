@@ -178,7 +178,7 @@ async fn connection_manager_loop_step(
         }
 
         // Fetch more etcd timeline updates, but limit ourselves since they may arrive quickly.
-        let mut max_events_to_poll = 1000_u32;
+        let mut max_events_to_poll = 100_u32;
         while max_events_to_poll > 0 {
             if let Ok(broker_update) = broker_subscription.value_updates.try_recv() {
                 walreceiver_state.register_timeline_update(broker_update);
@@ -210,7 +210,12 @@ async fn subscribe_for_timeline_updates(
 ) -> BrokerSubscription<SkTimelineInfo> {
     let mut attempt = 0;
     loop {
-        exponential_backoff(attempt, 2.0, 60.0).await;
+        exponential_backoff(
+            attempt,
+            DEFAULT_BASE_BACKOFF_SECONDS,
+            DEFAULT_MAX_BACKOFF_SECONDS,
+        )
+        .await;
         attempt += 1;
 
         match etcd_broker::subscribe_for_json_values(
@@ -230,6 +235,9 @@ async fn subscribe_for_timeline_updates(
         }
     }
 }
+
+const DEFAULT_BASE_BACKOFF_SECONDS: f64 = 2.0;
+const DEFAULT_MAX_BACKOFF_SECONDS: f64 = 60.0;
 
 async fn exponential_backoff(n: u32, base: f64, max_seconds: f64) {
     if n == 0 {
@@ -271,7 +279,6 @@ struct WalConnection {
 
 /// Data about the timeline to connect to, received from etcd.
 #[derive(Debug)]
-
 struct EtcdSkTimeline {
     timeline: SkTimelineInfo,
     /// Etcd generation, the bigger it is, the more up to date the timeline data is.
@@ -315,7 +322,12 @@ impl WalreceiverState {
             .unwrap_or(0);
         let connection_handle = TaskHandle::spawn(move |events_sender, cancellation| {
             async move {
-                exponential_backoff(connection_attempt, 2.0, 60.0).await;
+                exponential_backoff(
+                    connection_attempt,
+                    DEFAULT_BASE_BACKOFF_SECONDS,
+                    DEFAULT_MAX_BACKOFF_SECONDS,
+                )
+                .await;
                 super::walreceiver_connection::handle_walreceiver_connection(
                     id,
                     &new_wal_producer_connstr,
@@ -552,6 +564,9 @@ mod tests {
         let mut state = dummy_state(&harness);
         let now = Utc::now().naive_utc();
 
+        let lagging_wal_timeout = chrono::Duration::from_std(state.lagging_wal_timeout)?;
+        let delay_over_threshold = now - lagging_wal_timeout - lagging_wal_timeout;
+
         state.wal_connection = None;
         state.wal_stream_candidates = HashMap::from([
             (
@@ -600,6 +615,22 @@ mod tests {
                     },
                     etcd_version: 0,
                     latest_update: now,
+                },
+            ),
+            (
+                full_sk_key(state.id, NodeId(3)),
+                EtcdSkTimeline {
+                    timeline: SkTimelineInfo {
+                        last_log_term: None,
+                        flush_lsn: None,
+                        commit_lsn: Some(Lsn(1 + state.max_lsn_wal_lag.get())),
+                        backup_lsn: None,
+                        remote_consistent_lsn: None,
+                        peer_horizon_lsn: None,
+                        safekeeper_connstr: Some(DUMMY_SAFEKEEPER_CONNSTR.to_string()),
+                    },
+                    etcd_version: 0,
+                    latest_update: delay_over_threshold,
                 },
             ),
         ]);
@@ -805,6 +836,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_no_etcd_data_candidate() -> anyhow::Result<()> {
+        let harness = RepoHarness::create("connection_no_etcd_data_candidate")?;
+        let mut state = dummy_state(&harness);
+
+        let now = Utc::now().naive_utc();
+        let current_lsn = Lsn(100_000).align();
+        let connected_sk_id = NodeId(0);
+        let other_sk_id = NodeId(connected_sk_id.0 + 1);
+
+        state.wal_connection = Some(WalConnection {
+            sk_id: connected_sk_id,
+            latest_connection_update: now,
+            connection_task: TaskHandle::spawn(move |sender, _| async move {
+                sender
+                    .send(TaskEvent::NewEvent(ReplicationFeedback {
+                        current_timeline_size: 1,
+                        ps_writelsn: current_lsn.0,
+                        ps_applylsn: 1,
+                        ps_flushlsn: 1,
+                        ps_replytime: SystemTime::now(),
+                    }))
+                    .ok();
+                Ok(())
+            }),
+        });
+        state.wal_stream_candidates = HashMap::from([(
+            full_sk_key(state.id, other_sk_id),
+            EtcdSkTimeline {
+                timeline: SkTimelineInfo {
+                    last_log_term: None,
+                    flush_lsn: None,
+                    commit_lsn: Some(Lsn(1 + state.max_lsn_wal_lag.get())),
+                    backup_lsn: None,
+                    remote_consistent_lsn: None,
+                    peer_horizon_lsn: None,
+                    safekeeper_connstr: Some(DUMMY_SAFEKEEPER_CONNSTR.to_string()),
+                },
+                etcd_version: 0,
+                latest_update: now,
+            },
+        )]);
+
+        let only_candidate = state
+            .next_connection_candidate()
+            .expect("Expected one candidate selected out of the only data option, but got none");
+        assert_eq!(only_candidate.safekeeper_id, other_sk_id);
+        assert_eq!(
+            only_candidate.reason,
+            ReconnectReason::NoEtcdDataForExistingConnection,
+            "Should select new safekeeper due to missing etcd data, even if there's an existing connection with this safekeeper"
+        );
+        assert!(only_candidate
+            .wal_producer_connstr
+            .contains(DUMMY_SAFEKEEPER_CONNSTR));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn lsn_wal_over_threshhold_current_candidate() -> anyhow::Result<()> {
         let harness = RepoHarness::create("lsn_wal_over_threshcurrent_candidate")?;
         let mut state = dummy_state(&harness);
@@ -912,6 +1002,62 @@ mod tests {
                     .ok();
                 Ok(())
             }),
+        });
+        state.wal_stream_candidates = HashMap::from([(
+            full_sk_key(state.id, NodeId(0)),
+            EtcdSkTimeline {
+                timeline: SkTimelineInfo {
+                    last_log_term: None,
+                    flush_lsn: None,
+                    commit_lsn: Some(current_lsn),
+                    backup_lsn: None,
+                    remote_consistent_lsn: None,
+                    peer_horizon_lsn: None,
+                    safekeeper_connstr: Some(DUMMY_SAFEKEEPER_CONNSTR.to_string()),
+                },
+                etcd_version: 0,
+                latest_update: now,
+            },
+        )]);
+
+        let over_threshcurrent_candidate = state.next_connection_candidate().expect(
+            "Expected one candidate selected out of multiple valid data options, but got none",
+        );
+
+        assert_eq!(over_threshcurrent_candidate.safekeeper_id, NodeId(0));
+        match over_threshcurrent_candidate.reason {
+            ReconnectReason::NoWalTimeout {
+                last_wal_interaction,
+                threshold,
+                ..
+            } => {
+                assert_eq!(last_wal_interaction, Some(time_over_threshold));
+                assert_eq!(threshold, state.lagging_wal_timeout);
+            }
+            unexpected => panic!("Unexpected reason: {unexpected:?}"),
+        }
+        assert!(over_threshcurrent_candidate
+            .wal_producer_connstr
+            .contains(DUMMY_SAFEKEEPER_CONNSTR));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timeout_connection_over_threshhold_current_candidate() -> anyhow::Result<()> {
+        let harness = RepoHarness::create("timeout_connection_over_threshhold_current_candidate")?;
+        let mut state = dummy_state(&harness);
+        let current_lsn = Lsn(100_000).align();
+        let now = Utc::now().naive_utc();
+
+        let lagging_wal_timeout = chrono::Duration::from_std(state.lagging_wal_timeout)?;
+        let time_over_threshold =
+            Utc::now().naive_utc() - lagging_wal_timeout - lagging_wal_timeout;
+
+        state.wal_connection = Some(WalConnection {
+            sk_id: NodeId(1),
+            latest_connection_update: time_over_threshold,
+            connection_task: TaskHandle::spawn(move |_, _| async move { Ok(()) }),
         });
         state.wal_stream_candidates = HashMap::from([(
             full_sk_key(state.id, NodeId(0)),

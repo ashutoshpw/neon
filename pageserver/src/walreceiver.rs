@@ -166,11 +166,11 @@ async fn shutdown_all_wal_connections(
     })
     .await
     {
-        error!("Failed to spawn a task to make all tenants idle: {e:?}");
+        error!("Failed to await a task to make all tenants idle: {e:?}");
     }
 }
 
-/// A handle of an asynchronousl task.
+/// A handle of an asynchronous task.
 /// The task has a channel that it can use to communicate its lifecycle events in a certain form, see [`TaskEvent`]
 /// and a cancellation channel that it can listen to for earlier interrupts.
 ///

@@ -27,7 +27,7 @@ pub struct BrokerSubscription<V> {
     /// An unbounded channel to fetch the relevant etcd updates from.
     pub value_updates: mpsc::UnboundedReceiver<BrokerUpdate<V>>,
     key: SubscriptionKey,
-    /// A subscription task handle, to allow waiting on in for the task to complete.
+    /// A subscription task handle, to allow waiting on it for the task to complete.
     /// Both the updates channel and the handle require `&mut`, so it's better to keep
     /// both `pub` to allow using both in the same structures without borrow checker complaining.
     pub watcher_handle: JoinHandle<Result<(), BrokerError>>,
@@ -43,12 +43,20 @@ impl<V> BrokerSubscription<V> {
                 format!("Failed to cancel broker subscription, kind: {:?}", self.key),
             )
         })?;
-        self.watcher_handle.await.map_err(|e| {
-            BrokerError::InternalError(format!(
-                "Panicked during broker subscription task, kind: {:?}, error: {e}",
-                self.key
-            ))
-        })?
+        match self.watcher_handle.await {
+            Ok(res) => res,
+            Err(e) => {
+                if e.is_cancelled() {
+                    // don't error on the tasks that are cancelled already
+                    Ok(())
+                } else {
+                    Err(BrokerError::InternalError(format!(
+                        "Panicked during broker subscription task, kind: {:?}, error: {e}",
+                        self.key
+                    )))
+                }
+            }
+        }
     }
 }
 

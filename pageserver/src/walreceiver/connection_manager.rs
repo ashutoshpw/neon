@@ -125,22 +125,37 @@ async fn connection_manager_loop_step(
                     None => None,
                 }
             } => {
-                let connection_update = match &wal_connection_update {
-                    TaskEvent::Started => Some(Utc::now().naive_utc()),
-                    TaskEvent::NewEvent(replication_feedback) => Some(DateTime::<Local>::from(replication_feedback.ps_replytime).naive_utc()),
+                let (connection_update, reset_connection_attempts) = match &wal_connection_update {
+                    TaskEvent::Started => (Some(Utc::now().naive_utc()), true),
+                    TaskEvent::NewEvent(replication_feedback) => (Some(DateTime::<Local>::from(replication_feedback.ps_replytime).naive_utc()), true),
                     TaskEvent::End(end_result) => {
-                        match end_result {
-                            Ok(()) => debug!("WAL receiving task finished"),
-                            Err(e) =>  warn!("WAL receiving task failed: {e}"),
-                        }
+                        let should_reset_connection_attempts = match end_result {
+                            Ok(()) => {
+                                debug!("WAL receiving task finished");
+                                true
+                            },
+                            Err(e) => {
+                                warn!("WAL receiving task failed: {e}");
+                                false
+                            },
+                        };
                         walreceiver_state.wal_connection = None;
-                        None
+                        (None, should_reset_connection_attempts)
                     },
                 };
 
                 if let Some(connection_update) = connection_update {
                     match &mut walreceiver_state.wal_connection {
-                        Some(wal_connection) => wal_connection.latest_connection_update = connection_update,
+                        Some(wal_connection) => {
+                            wal_connection.latest_connection_update = connection_update;
+
+                            let attempts_entry = walreceiver_state.wal_connection_attempts.entry(wal_connection.sk_id).or_insert(0);
+                            if reset_connection_attempts {
+                                *attempts_entry = 0;
+                            } else {
+                                *attempts_entry += 1;
+                            }
+                        },
                         None => error!("Received connection update for WAL connection that is not active, update: {wal_connection_update:?}"),
                     }
                 }
@@ -238,6 +253,7 @@ struct WalreceiverState {
     max_lsn_wal_lag: NonZeroU64,
     /// Current connection to safekeeper for WAL streaming.
     wal_connection: Option<WalConnection>,
+    wal_connection_attempts: HashMap<NodeId, u32>,
     /// Data about all timelines, available for connection, fetched from etcd.
     wal_stream_candidates: HashMap<SubscriptionFullKey, EtcdSkTimeline>,
 }
@@ -280,6 +296,7 @@ impl WalreceiverState {
             max_lsn_wal_lag,
             wal_connection: None,
             wal_stream_candidates: HashMap::new(),
+            wal_connection_attempts: HashMap::new(),
         }
     }
 
@@ -291,8 +308,14 @@ impl WalreceiverState {
 
         let id = self.id;
         let connect_timeout = self.wal_connect_timeout;
+        let connection_attempt = self
+            .wal_connection_attempts
+            .get(&new_sk_id)
+            .copied()
+            .unwrap_or(0);
         let connection_handle = TaskHandle::spawn(move |events_sender, cancellation| {
             async move {
+                exponential_backoff(connection_attempt, 2.0, 60.0).await;
                 super::walreceiver_connection::handle_walreceiver_connection(
                     id,
                     &new_wal_producer_connstr,
@@ -950,6 +973,7 @@ mod tests {
             max_lsn_wal_lag: NonZeroU64::new(1).unwrap(),
             wal_connection: None,
             wal_stream_candidates: HashMap::new(),
+            wal_connection_attempts: HashMap::new(),
         }
     }
 

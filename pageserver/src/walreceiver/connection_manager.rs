@@ -19,11 +19,8 @@ use std::{
 use anyhow::Context;
 use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use etcd_broker::{
-    subscription_key::{
-        NodeKind, OperationKind, SkOperationKind, SubscriptionFullKey, SubscriptionKey,
-    },
-    subscription_value::SkTimelineInfo,
-    BrokerSubscription, BrokerUpdate, Client,
+    subscription_key::SubscriptionKey, subscription_value::SkTimelineInfo, BrokerSubscription,
+    BrokerUpdate, Client,
 };
 use tokio::select;
 use tracing::*;
@@ -96,11 +93,6 @@ async fn connection_manager_loop_step(
 
     loop {
         select! {
-            // the order of the polls is especially important here, since the first task to complete gets selected and the others get dropped (cancelled).
-            // place more frequetly updated tasks below to ensure the "slow" tasks are also reacted to.
-            biased;
-
-            // First, check if the broker connection is intact, otherwise we need to restart the whole step
             broker_connection_result = &mut broker_subscription.watcher_handle => {
                 match broker_connection_result {
                     Ok(Ok(())) => info!("Broker conneciton got cancelled, ending current broker loop step"),
@@ -111,8 +103,6 @@ async fn connection_manager_loop_step(
                 return;
             },
 
-            // Then, check if there are any updates from the current walreceiver task (if it's present).
-            // Register those updates in the state.
             Some(wal_connection_update) = async {
                 match walreceiver_state.wal_connection.as_mut() {
                     Some(wal_connection) => {
@@ -161,11 +151,6 @@ async fn connection_manager_loop_step(
                 }
             },
 
-            // If nothing else happens, ensure we are not stuck waiting and still react on etcd changes.
-            // Register the value from the broker or abort the loop, if the subscription got cancelled.
-
-            // XXX: etcd changes are frequent, so don't place it above the slower source events such as WAL receiver one, otherwise
-            // the slow ones might get ignored constantly.
             broker_update = broker_subscription.value_updates.recv() => {
                 match broker_update {
                     Some(broker_update) => walreceiver_state.register_timeline_update(broker_update),
@@ -262,8 +247,8 @@ struct WalreceiverState {
     /// Current connection to safekeeper for WAL streaming.
     wal_connection: Option<WalConnection>,
     wal_connection_attempts: HashMap<NodeId, u32>,
-    /// Data about all timelines, available for connection, fetched from etcd.
-    wal_stream_candidates: HashMap<SubscriptionFullKey, EtcdSkTimeline>,
+    /// Data about all timelines, available for connection, fetched from etcd, grouped by their corresponding safekeeper node id.
+    wal_stream_candidates: HashMap<NodeId, EtcdSkTimeline>,
 }
 
 /// Current connection data.
@@ -350,7 +335,10 @@ impl WalreceiverState {
 
     /// Adds another etcd timeline into the state, if its more recent than the one already added there for the same key.
     fn register_timeline_update(&mut self, timeline_update: BrokerUpdate<SkTimelineInfo>) {
-        match self.wal_stream_candidates.entry(timeline_update.key) {
+        match self
+            .wal_stream_candidates
+            .entry(timeline_update.key.node_id)
+        {
             hash_map::Entry::Occupied(mut o) => {
                 let existing_value = o.get_mut();
                 if existing_value.etcd_version < timeline_update.etcd_version {
@@ -388,20 +376,12 @@ impl WalreceiverState {
 
         match &self.wal_connection {
             Some(existing_wal_connection) => {
-                let connected_subscription_key = SubscriptionFullKey {
-                    id: self.id,
-                    node_kind: NodeKind::Safekeeper,
-                    operation: OperationKind::Safekeeper(SkOperationKind::TimelineInfo),
-                    node_id: existing_wal_connection.sk_id,
-                };
+                let connected_sk_node = existing_wal_connection.sk_id;
 
-                let (new_key, new_safekeeper_etcd_data, new_wal_producer_connstr) = self
+                let (new_sk_id, new_safekeeper_etcd_data, new_wal_producer_connstr) = self
                     .applicable_connection_candidates()
-                    .filter(|&(subscription_key, _, _)| {
-                        subscription_key != connected_subscription_key
-                    })
+                    .filter(|&(sk_id, _, _)| sk_id != connected_sk_node)
                     .max_by_key(|(_, info, _)| info.commit_lsn)?;
-                let new_sk_id = new_key.node_id;
 
                 let now = Utc::now().naive_utc();
                 if let Ok(latest_interaciton) =
@@ -422,7 +402,7 @@ impl WalreceiverState {
                     }
                 }
 
-                match self.wal_stream_candidates.get(&connected_subscription_key) {
+                match self.wal_stream_candidates.get(&connected_sk_node) {
                     Some(current_connection_etcd_data) => {
                         let new_lsn = new_safekeeper_etcd_data.commit_lsn.unwrap_or(Lsn(0));
                         let current_lsn = current_connection_etcd_data
@@ -454,11 +434,11 @@ impl WalreceiverState {
                 }
             }
             None => {
-                let (new_key, _, new_wal_producer_connstr) = self
+                let (new_sk_id, _, new_wal_producer_connstr) = self
                     .applicable_connection_candidates()
                     .max_by_key(|(_, info, _)| info.commit_lsn)?;
                 return Some(NewWalConnectionCandidate {
-                    safekeeper_id: new_key.node_id,
+                    safekeeper_id: new_sk_id,
                     wal_producer_connstr: new_wal_producer_connstr,
                     reason: ReconnectReason::NoExistingConnection,
                 });
@@ -470,21 +450,21 @@ impl WalreceiverState {
 
     fn applicable_connection_candidates(
         &self,
-    ) -> impl Iterator<Item = (SubscriptionFullKey, &SkTimelineInfo, String)> {
+    ) -> impl Iterator<Item = (NodeId, &SkTimelineInfo, String)> {
         self.wal_stream_candidates
             .iter()
             .filter(|(_, etcd_info)| {
                 etcd_info.timeline.commit_lsn > Some(self.local_timeline.get_last_record_lsn())
             })
-            .filter_map(|(key, etcd_info)| {
+            .filter_map(|(sk_id, etcd_info)| {
                 let info = &etcd_info.timeline;
                 match wal_stream_connection_string(
                     self.id,
                     info.safekeeper_connstr.as_deref()?,
                 ) {
-                    Ok(connstr) => Some((*key, info, connstr)),
+                    Ok(connstr) => Some((*sk_id, info, connstr)),
                     Err(e) => {
-                        error!("Failed to create wal receiver connection string from broker data of safekeeper node {}: {e:#}", key.node_id);
+                        error!("Failed to create wal receiver connection string from broker data of safekeeper node {}: {e:#}", sk_id);
                         None
                     }
                 }
@@ -570,7 +550,7 @@ mod tests {
         state.wal_connection = None;
         state.wal_stream_candidates = HashMap::from([
             (
-                full_sk_key(state.id, NodeId(0)),
+                NodeId(0),
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -586,7 +566,7 @@ mod tests {
                 },
             ),
             (
-                full_sk_key(state.id, NodeId(1)),
+                NodeId(1),
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -602,7 +582,7 @@ mod tests {
                 },
             ),
             (
-                full_sk_key(state.id, NodeId(2)),
+                NodeId(2),
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -618,7 +598,7 @@ mod tests {
                 },
             ),
             (
-                full_sk_key(state.id, NodeId(3)),
+                NodeId(3),
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -672,7 +652,7 @@ mod tests {
         });
         state.wal_stream_candidates = HashMap::from([
             (
-                full_sk_key(state.id, connected_sk_id),
+                connected_sk_id,
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -688,7 +668,7 @@ mod tests {
                 },
             ),
             (
-                full_sk_key(state.id, NodeId(1)),
+                NodeId(1),
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -704,7 +684,7 @@ mod tests {
                 },
             ),
             (
-                full_sk_key(state.id, NodeId(2)),
+                NodeId(2),
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -738,7 +718,7 @@ mod tests {
 
         state.wal_connection = None;
         state.wal_stream_candidates = HashMap::from([(
-            full_sk_key(state.id, NodeId(0)),
+            NodeId(0),
             EtcdSkTimeline {
                 timeline: SkTimelineInfo {
                     last_log_term: None,
@@ -770,7 +750,7 @@ mod tests {
         let selected_lsn = 100_000;
         state.wal_stream_candidates = HashMap::from([
             (
-                full_sk_key(state.id, NodeId(0)),
+                NodeId(0),
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -786,7 +766,7 @@ mod tests {
                 },
             ),
             (
-                full_sk_key(state.id, NodeId(1)),
+                NodeId(1),
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -802,7 +782,7 @@ mod tests {
                 },
             ),
             (
-                full_sk_key(state.id, NodeId(2)),
+                NodeId(2),
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -862,7 +842,7 @@ mod tests {
             }),
         });
         state.wal_stream_candidates = HashMap::from([(
-            full_sk_key(state.id, other_sk_id),
+            other_sk_id,
             EtcdSkTimeline {
                 timeline: SkTimelineInfo {
                     last_log_term: None,
@@ -922,7 +902,7 @@ mod tests {
         });
         state.wal_stream_candidates = HashMap::from([
             (
-                full_sk_key(state.id, connected_sk_id),
+                connected_sk_id,
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -938,7 +918,7 @@ mod tests {
                 },
             ),
             (
-                full_sk_key(state.id, NodeId(1)),
+                NodeId(1),
                 EtcdSkTimeline {
                     timeline: SkTimelineInfo {
                         last_log_term: None,
@@ -1004,7 +984,7 @@ mod tests {
             }),
         });
         state.wal_stream_candidates = HashMap::from([(
-            full_sk_key(state.id, NodeId(0)),
+            NodeId(0),
             EtcdSkTimeline {
                 timeline: SkTimelineInfo {
                     last_log_term: None,
@@ -1060,7 +1040,7 @@ mod tests {
             connection_task: TaskHandle::spawn(move |_, _| async move { Ok(()) }),
         });
         state.wal_stream_candidates = HashMap::from([(
-            full_sk_key(state.id, NodeId(0)),
+            NodeId(0),
             EtcdSkTimeline {
                 timeline: SkTimelineInfo {
                     last_log_term: None,
@@ -1120,15 +1100,6 @@ mod tests {
             wal_connection: None,
             wal_stream_candidates: HashMap::new(),
             wal_connection_attempts: HashMap::new(),
-        }
-    }
-
-    fn full_sk_key(id: ZTenantTimelineId, sk_id: NodeId) -> SubscriptionFullKey {
-        SubscriptionFullKey {
-            id,
-            node_kind: NodeKind::Safekeeper,
-            operation: OperationKind::Safekeeper(SkOperationKind::TimelineInfo),
-            node_id: sk_id,
         }
     }
 }

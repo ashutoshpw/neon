@@ -130,8 +130,6 @@ pub async fn handle_walreceiver_connection(
 
     while let Some(replication_message) = {
         select! {
-            // check for shutdown first
-            biased;
             _ = cancellation.changed() => {
                 info!("walreceiver interrupted");
                 None

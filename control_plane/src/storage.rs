@@ -210,6 +210,15 @@ impl PageServerNode {
         self.repo_path().join("pageserver.pid")
     }
 
+    pub fn status(&self) -> &str {
+        let pid_file = self.pid_file();
+        if !pid_file.exists() {
+            return "stopped";
+        } else {
+            return "running";
+        }
+    }
+
     pub fn start(&self, config_overrides: &[&str]) -> anyhow::Result<()> {
         print!(
             "Starting pageserver at '{}' in '{}'",

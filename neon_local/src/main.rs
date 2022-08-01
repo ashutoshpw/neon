@@ -193,8 +193,7 @@ fn main() -> Result<()> {
                 .about("Manage pageserver")
                 .subcommand(App::new("status"))
                 .subcommand(App::new("start").about("Start local pageserver").arg(pageserver_config_args.clone()))
-                .subcommand(App::new("stop").about("Stop local pageserver")
-                            .arg(stop_mode_arg.clone()))
+                .subcommand(App::new("stop").about("Stop local pageserver").arg(stop_mode_arg.clone()))
                 .subcommand(App::new("restart").about("Restart local pageserver").arg(pageserver_config_args.clone()))
         )
         .subcommand(
@@ -896,6 +895,12 @@ fn handle_pageserver(sub_match: &ArgMatches, env: &local_env::LocalEnv) -> Resul
                 eprintln!("pageserver stop failed: {}", e);
                 exit(1);
             }
+        }
+
+        Some(("status", _status_match)) => {
+            let status: &str = pageserver.status();
+            eprintln!("pageserver status is {}", status);
+            exit(1);
         }
 
         Some(("restart", restart_match)) => {
